@@ -9,7 +9,7 @@ LOG="$HOME/Library/Logs/FanLite.log"
 
 echo "== FanLite: prueba de control de ventiladores =="
 echo
-echo "  1. macOS te va a pedir la contraseña de administrador."
+echo "  1. Escribí tu contraseña acá abajo (sudo)."
 echo "  2. Los ventiladores suben al 40% durante 6 segundos y vuelven solos a Auto."
 echo "     (deberías escucharlos)"
 echo
@@ -20,12 +20,10 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-"$BIN" --selftest
-echo "esperando a que termine la prueba…"
-sleep 20
+sudo "$BIN" --selftest
 
 echo
 echo "== últimas líneas de $LOG =="
-tail -n 30 "$LOG"
+tail -n 25 "$LOG"
 echo
 read -n 1 -s -r -p "Enter para cerrar esta ventana"
