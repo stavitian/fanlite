@@ -72,8 +72,26 @@ protocol SMCDevice: AnyObject {
     func bytes(_ key: String) throws -> [UInt8]
     func write(_ key: String, _ value: [UInt8]) throws
     func number(_ key: String) throws -> Double?
+    func numbers(_ keys: [String]) -> [String: Double]
     func uint8(_ key: String) throws -> Int?
     func allKeys() -> [String]
+    /// Descarta el caché de key-info que no se vaya a volver a usar.
+    func trimInfoCache(keeping keys: Set<String>)
+}
+
+extension SMCDevice {
+    /// Versión genérica para los SMC que no tienen una implementación por lote.
+    func numbers(_ keys: [String]) -> [String: Double] {
+        var values = [String: Double](minimumCapacity: keys.count)
+        for key in keys {
+            do {
+                if let value = try number(key), value.isFinite { values[key] = value }
+            } catch {}
+        }
+        return values
+    }
+
+    func trimInfoCache(keeping keys: Set<String>) {}
 }
 
 /// Codifica un objetivo de RPM para el tipo real de la clave de destino.
@@ -89,6 +107,11 @@ func encodeRPM(_ rpm: Double, type: String) -> [UInt8]? {
     default:
         return nil
     }
+}
+
+/// Contadores que llegan al kernel desde que arrancó el proceso (los lleva la capa C).
+func smcCallStats() -> (reads: UInt64, writes: UInt64) {
+    (fp_smc_stat_reads(), fp_smc_stat_writes())
 }
 
 final class SMC: SMCDevice {
@@ -130,11 +153,13 @@ final class SMC: SMCDevice {
     // MARK: - Read / write
 
     func bytes(_ key: String) throws -> [UInt8] {
-        try queue.sync { try readLocked(key) }
+        try queue.sync {
+            let info = try infoLocked(key)
+            return try readLocked(key, info: info)
+        }
     }
 
-    private func readLocked(_ key: String) throws -> [UInt8] {
-        let info = try infoLocked(key)
+    private func readLocked(_ key: String, info: KeyInfo) throws -> [UInt8] {
         var input = SMCKeyData_t()
         input.key = fourCC(key)
         input.data8 = UInt8(FP_SMC_CMD_READ)
@@ -182,9 +207,28 @@ final class SMC: SMCDevice {
 
     /// Valor numérico de una clave, o nil si la clave no existe o su tipo no es numérico.
     func number(_ key: String) throws -> Double? {
+        try queue.sync { try numberLocked(key) }
+    }
+
+    /// Varias claves en una sola entrada a la cola del SMC: una vuelta de control toca
+    /// temperaturas y estado de todos los ventiladores, así que hacerlo de a una suma
+    /// decenas de `dispatch_sync` por segundo sin necesidad.
+    func numbers(_ keys: [String]) -> [String: Double] {
+        queue.sync {
+            var values = [String: Double](minimumCapacity: keys.count)
+            for key in keys {
+                do {
+                    if let value = try numberLocked(key), value.isFinite { values[key] = value }
+                } catch {}
+            }
+            return values
+        }
+    }
+
+    private func numberLocked(_ key: String) throws -> Double? {
         do {
-            let info = try info(key)
-            let b = try bytes(key)
+            let info = try infoLocked(key)
+            let b = try readLocked(key, info: info)
             switch info.cleanType {
             case "flt":
                 guard b.count == 4 else { throw SMCFault.badType(key, "flt de \(b.count) bytes") }
@@ -212,6 +256,14 @@ final class SMC: SMCDevice {
     func uint8(_ key: String) throws -> Int? {
         guard let v = try number(key) else { return nil }
         return Int(v)
+    }
+
+    /// El descubrimiento consulta el key-info de cientos de sensores; una vez elegidos los
+    /// que se van a leer, el resto no se usa nunca más.
+    func trimInfoCache(keeping keys: Set<String>) {
+        queue.sync {
+            infoCache = infoCache.filter { keys.contains($0.key) }
+        }
     }
 
     // MARK: - Enumeración

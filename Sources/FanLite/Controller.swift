@@ -22,8 +22,8 @@ struct Snapshot {
     var note: String?
 }
 
-/// El corazón de FanLite: un timer cada 2 s que lee temperaturas y ventiladores y, si el modo
-/// no es Auto, escribe el objetivo en el SMC.
+/// El corazón de FanLite: un timer adaptativo (1,5–3 s) que lee temperaturas y el estado de los
+/// ventiladores y, si el modo no es Auto, escribe el objetivo en el SMC.
 ///
 /// Todo el estado vive en una cola serial. La UI solo recibe copias (`Snapshot`) en el main.
 final class Controller {
@@ -39,12 +39,21 @@ final class Controller {
 
     /// Por encima de esto los ventiladores van al máximo, sin importar la curva.
     static let failsafeTempC: Double = 93
-    /// Si el objetivo real se aleja más de esto de lo que escribimos, lo reescribimos.
+    /// Si el objetivo real se aleja más de esto de lo que pedimos, se reescribe.
     static let driftToleranceRPM: Double = 20
+    /// No se manda una escritura nueva hasta que la curva pida al menos ~1 % del rango del
+    /// ventilador (~55 rpm en esta Mac). Antes se escribía en cada vuelta por cambios de 5 rpm.
+    static let writeDeadbandFraction: Double = 0.01
+    static let minWriteDeadbandRPM: Double = 25
+    /// Los límites `F<n>Mn/Mx` no cambian en la práctica: se releen cada ~1 minuto.
+    static let limitsEveryCycles = 20
     /// Lecturas fallidas seguidas antes de soltar los ventiladores a Auto.
     static let tempMissLimit = 15
     /// Peso de la muestra nueva en el suavizado de temperatura (1 = sin suavizado).
     static let tempAlpha: Double = 0.4
+    /// Piso y techo del lazo adaptativo. Estable → más lento; cambiando → más rápido.
+    static let minInterval: Double = 1.5
+    static let maxCurveInterval: Double = 3.0
 
     private let smc: SMCDevice
     private let queue = DispatchQueue(label: "fanlite.control")
@@ -55,12 +64,25 @@ final class Controller {
     private var fans: [Int: FanKeys] = [:]
     private var tempKeys: [String] = []
     private var lastWritten: [Int: Double] = [:]
+    private var lastActual: [Int: Double] = [:]
     private var owned: Set<Int> = []
     private var tempMisses = 0
     private var smoothedTemp: Double?
     private var failsafeOn = false
     private var healedStale = false
     private var ready = false
+    private var cycles = 0
+    private var quietCycles = 0
+    private var lastRawTemp: Double?
+    private var currentInterval: Double = 2.0
+    private var statsBase: (reads: UInt64, writes: UInt64) = (0, 0)
+    private var curveCommitScheduled = false
+    private var stopped = false
+    private let startedAt = Date()
+
+    /// Solo se leen los RPM reales (`F<n>Ac`) cuando el panel está visible: es el único lugar
+    /// donde se muestran. El control no los necesita. Interno para que `--simulate` lo pruebe.
+    var uiActive = false
 
     /// Normalmente sale de geteuid(); --simulate lo fuerza para probar la lógica sin root.
     var assumePrivileged = geteuid() == 0
@@ -79,10 +101,13 @@ final class Controller {
     func start() {
         queue.async { [weak self] in
             guard let self else { return }
-            self.discover()
-            self.ready = true
-            self.publish()
-            self.schedule()
+            autoreleasepool {
+                self.discover()
+                self.ready = true
+                self.publish()
+                self.currentInterval = self.baseInterval()
+                self.schedule()
+            }
         }
     }
 
@@ -91,14 +116,27 @@ final class Controller {
         let done = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
             guard let self else { done.signal(); return }
-            self.timer?.cancel()
-            self.timer = nil
-            if geteuid() == 0 {
-                let states = self.readStates()
-                if !states.isEmpty {
-                    log("saliendo: ventiladores a Auto")
-                    self.releaseAll(states)
+            autoreleasepool {
+                self.stopped = true
+                let pendingCurveSave = self.curveCommitScheduled
+                self.curveCommitScheduled = false
+                self.timer?.cancel()
+                self.timer = nil
+                // Si se cerró en medio de un arrastre, guarda la última curva.
+                if pendingCurveSave { Store.save(self.settings) }
+                if geteuid() == 0 {
+                    let states = self.readStates()
+                    if !states.isEmpty {
+                        log("saliendo: ventiladores a Auto")
+                        self.releaseAll(states)
+                    }
                 }
+                let stats = smcCallStats()
+                let reads = stats.reads &- self.statsBase.reads
+                let writes = stats.writes &- self.statsBase.writes
+                let elapsed = max(Date().timeIntervalSince(self.startedAt), 1)
+                log(String(format: "SMC: %llu lecturas, %llu escrituras en %.0f s (descubrimiento aparte)",
+                           reads, writes, elapsed))
             }
             done.signal()
         }
@@ -114,16 +152,46 @@ final class Controller {
             self.settings.mode = mode
             Store.save(self.settings)
             log("modo -> \(mode.label)")
-            self.reschedule()
+            self.restartTimer()
             self.tick()
+        }
+    }
+
+    /// El panel se abrió o se cerró. Al abrirlo se leen los RPM reales y se refresca ya.
+    func setUIActive(_ active: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.uiActive != active else { return }
+            self.uiActive = active
+            if active { self.tick() }
+        }
+    }
+
+    /// Preferencia del panel: pedir la contraseña al arrancar si la última vez se usó Curva/Máx.
+    func setAutoElevateOnLaunch(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.settings.wantsAutoElevation != enabled else { return }
+            self.settings.autoElevateOnLaunch = enabled
+            Store.save(self.settings)
         }
     }
 
     func setCurve(_ curve: Curve) {
         queue.async { [weak self] in
-            guard let self else { return }
-            guard self.settings.curve != curve else { return }
+            guard let self, self.settings.curve != curve else { return }
             self.settings.curve = curve
+            self.scheduleCurveCommit()
+        }
+    }
+
+    /// El editor llama a `setCurve` en cada evento del mouse. Guardar el JSON y leer el SMC en
+    /// cada uno era una ráfaga de decenas de operaciones por segundo mientras se arrastra un
+    /// punto; con esto se hace como máximo un commit cada 0,4 s durante el arrastre.
+    private func scheduleCurveCommit() {
+        guard !curveCommitScheduled else { return }
+        curveCommitScheduled = true
+        queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.curveCommitScheduled = false
             Store.save(self.settings)
             if self.settings.mode == .curve { self.tick() }
         }
@@ -172,6 +240,19 @@ final class Controller {
             Store.save(settings)
         }
         log("sensores para la curva (\(tempKeys.count)): \(tempKeys.joined(separator: " "))")
+
+        // El descubrimiento tocó el key-info de cientos de claves; a partir de acá solo se
+        // usan estos ventiladores y estos sensores.
+        var keep = Set(tempKeys)
+        for (index, keys) in fans {
+            keep.insert(keys.mode)
+            keep.insert(keys.target)
+            keep.insert("F\(index)Ac")
+            keep.insert("F\(index)Mn")
+            keep.insert("F\(index)Mx")
+        }
+        smc.trimInfoCache(keeping: keep)
+        statsBase = smcCallStats()
     }
 
     private func fanName(_ index: Int) -> String {
@@ -185,7 +266,7 @@ final class Controller {
 
     /// Recorre las claves del SMC y se queda con las de núcleos de CPU y GPU (`Tp..`, `Tm..`,
     /// `Tg..`) que devuelven una temperatura razonable. De cada familia guarda hasta 6, repartidas:
-    /// leer 18 claves cada 2 s cuesta ~10 ms y cubre todo el chip.
+    /// cubre todo el chip y son lecturas baratas comparadas con recorrer las 3600 claves.
     private func scanTempKeys() -> [String] {
         var byFamily: [String: [String]] = [:]
         for key in smc.allKeys() {
@@ -212,58 +293,148 @@ final class Controller {
 
     private func schedule() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 1, repeating: interval, leeway: .milliseconds(250))
-        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.schedule(deadline: .now() + min(1.0, currentInterval),
+                       repeating: currentInterval,
+                       leeway: leeway(for: currentInterval))
+        timer.setEventHandler { [weak self] in
+            autoreleasepool { self?.tick() }
+        }
         timer.resume()
         self.timer = timer
     }
 
-    private func reschedule() {
+    private func restartTimer() {
+        currentInterval = baseInterval()
         timer?.cancel()
         timer = nil
         schedule()
     }
 
-    private var interval: Double {
-        settings.mode == .auto ? 3.0 : 2.0
+    /// Cambia el período sin recrear la fuente. `DispatchSourceTimer` permite reprogramarse
+    /// mientras está corriendo; sólo vale la pena si el cambio es perceptible.
+    private func setInterval(_ newValue: Double) {
+        let clamped = min(max(newValue, Self.minInterval), Self.maxCurveInterval)
+        guard abs(clamped - currentInterval) >= 0.2 else { return }
+        currentInterval = clamped
+        timer?.schedule(deadline: .now() + clamped,
+                        repeating: clamped,
+                        leeway: leeway(for: clamped))
     }
 
-    private func readStates() -> [FanState] {
+    private func leeway(for interval: Double) -> DispatchTimeInterval {
+        .milliseconds(Int(max(150, interval * 100)))
+    }
+
+    /// Período base según el modo. En curva se ajusta después con `nextInterval`.
+    private func baseInterval() -> Double {
+        let configured = min(max(settings.interval, Self.minInterval), Self.maxCurveInterval)
+        switch settings.mode {
+        case .auto: return max(3.0, configured)
+        case .max: return max(2.5, configured)
+        case .curve: return configured
+        }
+    }
+
+    /// Si la temperatura está quieta, se puede tardar más; si se mueve, se reacciona antes.
+    /// El failsafe siempre va rápido. Para bajar a 3 s pide tres lecturas tranquilas seguidas:
+    /// así el ruido de ±0,2 °C no está cambiando el período en cada vuelta.
+    private func nextInterval(for cpu: Double?, previous: Double?) -> Double {
+        if failsafeOn {
+            quietCycles = 0
+            return Self.minInterval
+        }
+        let base = baseInterval()
+        guard settings.mode == .curve else {
+            quietCycles = 0
+            return base
+        }
+        guard let cpu, let previous else {
+            quietCycles = 0
+            return base
+        }
+        let delta = abs(cpu - previous)
+        if delta >= 0.5 {
+            quietCycles = 0
+            return max(Self.minInterval, base - 0.5)
+        }
+        if delta <= 0.2 {
+            quietCycles += 1
+            if quietCycles >= 3 { return min(Self.maxCurveInterval, base + 1.0) }
+        } else {
+            quietCycles = 0
+        }
+        return base
+    }
+
+    /// Lee lo mínimo por vuelta: modo y objetivo de cada ventilador. Los RPM reales solo se
+    /// piden con el panel abierto y los límites cada `limitsEveryCycles` vueltas.
+    private func readStates(forceLimits: Bool = false) -> [FanState] {
+        let refreshLimits = forceLimits || (cycles > 0 && cycles % Self.limitsEveryCycles == 0)
+        // En Auto (o en modo lectura) el objetivo no se usa para nada: alcanza con el modo
+        // para saber si hay que devolver un ventilador a macOS.
+        let wantsTarget = assumePrivileged && settings.mode != .auto
+        var wanted: [String] = []
+        wanted.reserveCapacity(fans.count * (uiActive ? 3 : 2) + (refreshLimits ? fans.count * 2 : 0))
+        for (index, keys) in fans {
+            wanted.append(keys.mode)
+            if wantsTarget { wanted.append(keys.target) }
+            if uiActive { wanted.append("F\(index)Ac") }
+            if refreshLimits {
+                wanted.append("F\(index)Mn")
+                wanted.append("F\(index)Mx")
+            }
+        }
+        let values = smc.numbers(wanted)
+
         var states: [FanState] = []
-        for (index, keys) in fans.sorted(by: { $0.key < $1.key }) {
-            var state = FanState(index: index, name: keys.name, actual: 0, target: 0, mode: 0,
-                                 minRPM: keys.minRPM, maxRPM: keys.maxRPM, controllable: true, error: nil)
-            do {
-                state.actual = (try smc.number("F\(index)Ac")).flatMap { $0 } ?? 0
-                state.target = (try smc.number(keys.target)).flatMap { $0 } ?? 0
-                state.mode = (try smc.uint8(keys.mode)) ?? 0
-                // Los límites se releen siempre: son el techo real del clamp, no un valor de arranque.
-                if let lo = (try smc.number("F\(index)Mn")).flatMap({ $0 }), lo.isFinite, lo >= 0 { state.minRPM = lo }
-                if let hi = (try smc.number("F\(index)Mx")).flatMap({ $0 }), hi.isFinite, hi > state.minRPM { state.maxRPM = hi }
-            } catch {
-                state.error = "\(error)"
+        for (index, cachedKeys) in fans.sorted(by: { $0.key < $1.key }) {
+            var keys = cachedKeys
+            if refreshLimits {
+                if let lo = values["F\(index)Mn"], lo.isFinite, lo >= 0 { keys.minRPM = lo }
+                if let hi = values["F\(index)Mx"], hi.isFinite, hi > keys.minRPM { keys.maxRPM = hi }
+                fans[index] = keys
+            }
+
+            var state = FanState(index: index, name: keys.name,
+                                 actual: lastActual[index] ?? 0,
+                                 target: wantsTarget ? (values[keys.target] ?? 0) : 0,
+                                 mode: Int(values[keys.mode] ?? 0),
+                                 minRPM: keys.minRPM, maxRPM: keys.maxRPM,
+                                 controllable: true, error: nil)
+            if uiActive, let actual = values["F\(index)Ac"], actual.isFinite {
+                state.actual = actual
+                lastActual[index] = actual
+            }
+            if values[keys.mode] == nil || (wantsTarget && values[keys.target] == nil) {
+                state.error = "sin lecturas del SMC"
             }
             states.append(state)
         }
         return states
     }
 
-    func tick() {
+    func tick(forceLimits: Bool = false) {
+        guard !stopped else { return }
         let privileged = assumePrivileged
         var note: String?
 
-        // 1. Temperatura: el máximo de los sensores elegidos.
-        var temps: [Double] = []
-        for key in tempKeys {
-            if let value = (try? smc.number(key)).flatMap({ $0 }), value.isFinite, value > 5, value < 125 {
+        // 1. Temperatura: el máximo de los sensores elegidos, en una sola entrada al SMC.
+        var cpu: Double?
+        if !tempKeys.isEmpty {
+            let values = smc.numbers(tempKeys)
+            var temps: [Double] = []
+            temps.reserveCapacity(values.count)
+            for value in values.values where value.isFinite && value > 5 && value < 125 {
                 temps.append(value)
             }
+            cpu = temps.max()
         }
-        let cpu = temps.max()
-        tempMisses = temps.isEmpty ? tempMisses + 1 : 0
+        let previousRaw = lastRawTemp
+        lastRawTemp = cpu
+        tempMisses = cpu == nil ? tempMisses + 1 : 0
 
         // 2. Estado real de los ventiladores.
-        let states = readStates()
+        let states = readStates(forceLimits: forceLimits)
 
         // 3. Primera vuelta: si quedó algo en manual de una corrida anterior, se devuelve a Auto.
         if !healedStale {
@@ -334,20 +505,29 @@ final class Controller {
         snap.note = note
         snapshot = snap
         DispatchQueue.main.async { [weak self] in self?.onUpdate?(snap) }
+
+        // 6. Siguiente vuelta: rápida si la temperatura se está moviendo, lenta si está quieta.
+        cycles &+= 1
+        setInterval(nextInterval(for: cpu, previous: previousRaw))
     }
 
     // MARK: - Escrituras
 
-    /// Lleva todos los ventiladores al porcentaje pedido: modo manual si hace falta y objetivo
-    /// solo si el que ya está puesto se fue más de 20 rpm de lo nuestro (eso cubre también el caso
-    /// en que macOS nos pisa el objetivo).
+    /// Lleva todos los ventiladores al porcentaje pedido. Se escribe si el SMC se alejó del
+    /// objetivo (macOS nos pisó) o si la curva pide un cambio mayor a la banda muerta. Así una
+    /// temperatura que sube de a 0,1 °C no genera una escritura en cada vuelta.
     private func apply(percent: Double, states: [FanState]) {
+        let fraction = min(max(percent / 100, 0), 1)
         for state in states {
-            guard let keys = fans[state.index] else { continue }
+            guard state.error == nil, let keys = fans[state.index] else { continue }
             if state.mode != 1, !engage(state, keys: keys) { continue }
-            let wanted = (state.minRPM + percent / 100 * (state.maxRPM - state.minRPM)).rounded()
-            let current = state.target
-            if state.mode == 1, abs(current - wanted) <= Self.driftToleranceRPM { continue }
+            let wanted = (state.minRPM + fraction * (state.maxRPM - state.minRPM)).rounded()
+            let deadband = max(Self.minWriteDeadbandRPM,
+                               (state.maxRPM - state.minRPM) * Self.writeDeadbandFraction)
+            let reference = lastWritten[state.index] ?? state.target
+            let drifted = abs(state.target - wanted) > Self.driftToleranceRPM
+            let bigEnoughStep = abs(reference - wanted) > deadband
+            if !drifted && !bigEnoughStep { continue }
             setTarget(state, keys: keys, rpm: wanted)
         }
     }
@@ -383,13 +563,11 @@ final class Controller {
             if attempt > 0 { Thread.sleep(forTimeInterval: 0.1) }
             do {
                 try smc.write(keys.target, payload)
-                if let back = (try? smc.number(keys.target)).flatMap({ $0 }), abs(back - clamped) <= 2 {
-                    if lastWritten[state.index] != clamped {
-                        log("ventilador \(state.index): \(Int(clamped)) rpm (\(keys.name))")
-                    }
-                    lastWritten[state.index] = clamped
-                    return
+                if lastWritten[state.index] != clamped {
+                    log("ventilador \(state.index): \(Int(clamped)) rpm (\(keys.name))")
                 }
+                lastWritten[state.index] = clamped
+                return
             } catch {
                 if let fault = error as? SMCFault, fault.isPermanent {
                     log("el ventilador \(state.index) no acepta el objetivo: \(error)")

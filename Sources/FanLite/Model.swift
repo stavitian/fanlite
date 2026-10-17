@@ -60,8 +60,16 @@ struct FanLiteSettings: Codable {
     /// Claves de temperatura descubiertas una vez y guardadas: así el arranque siguiente
     /// no tiene que recorrer las 3600 claves del SMC.
     var cpuTempKeys: [String]? = nil
-    /// Cada cuánto se muestrea, en segundos.
+    /// Período base de muestreo, en segundos. El controlador lo estira si la temperatura está
+    /// quieta (hasta 3 s) y lo acorta si se mueve (hasta 1,5 s).
     var interval: Double = 2.0
+
+    /// Pide la contraseña al abrir la app si la última vez se usó Curva o Máx.
+    /// Opcional a propósito: las configs viejas (sin esta clave) decodifican sin migración y
+    /// el valor por defecto es `true`.
+    var autoElevateOnLaunch: Bool? = nil
+
+    var wantsAutoElevation: Bool { autoElevateOnLaunch ?? true }
 }
 
 // MARK: - Rutas (funciona igual como usuario y como root)
@@ -123,8 +131,31 @@ enum Store {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(settings).write(to: Paths.config, options: .atomic)
+            adoptPathsForConsoleUser()
         } catch {
             log("no pude guardar los ajustes: \(error)")
+        }
+    }
+
+    /// Cuando la app corre como root, el config y el log quedan en el home del usuario pero con
+    /// dueño root. Si no se los devolvemos al usuario de la consola, la próxima instancia sin
+    /// privilegios no puede guardar los ajustes (por ejemplo, el modo elegido antes de elevar).
+    static func adoptPathsForConsoleUser() {
+        guard geteuid() == 0 else { return }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: "/dev/console"),
+              let uid = attrs[.ownerAccountID] as? NSNumber,
+              let gid = attrs[.groupOwnerAccountID] as? NSNumber,
+              uid.uint32Value != 0 else { return }
+
+        let manager = FileManager.default
+        var urls = [Paths.supportDirectory, Paths.config, Paths.log]
+        urls.append(Paths.supportDirectory.appendingPathComponent("instance.pid"))
+        urls.append(Paths.supportDirectory.appendingPathComponent("root.pid"))
+        for url in urls where manager.fileExists(atPath: url.path) {
+            try? manager.setAttributes([
+                .ownerAccountID: uid,
+                .groupOwnerAccountID: gid,
+            ], ofItemAtPath: url.path)
         }
     }
 }

@@ -1,0 +1,11 @@
+FanLite
+Copyright (c) 2026 FanLite contributors
+
+This product includes the AppleSMC C layer from FanPilot:
+
+  FanPilot
+  https://github.com/zyvren/FanPilot
+  Copyright (c) zyvren
+  Licensed under the MIT License.
+
+The files in question are Sources/CSMC/smc.c and Sources/CSMC/include/smc.h.

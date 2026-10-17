@@ -167,12 +167,14 @@ final class PopoverView: NSView {
     let noteLabel = NSTextField(labelWithString: "")
     let modeControl: NSSegmentedControl
     let curveView = CurveEditorView()
+    let autoElevateCheckbox = NSButton(checkboxWithTitle: "Pedir permisos al iniciar", target: nil, action: nil)
     let quitButton = NSButton(title: "Salir", target: nil, action: nil)
 
     static let modes: [FanMode] = [.auto, .curve, .max]
 
     var onModeChange: ((FanMode) -> Void)?
     var onCurveChange: ((Curve) -> Void)?
+    var onAutoElevateChange: ((Bool) -> Void)?
     var onQuit: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
@@ -204,6 +206,12 @@ final class PopoverView: NSView {
 
         curveView.onChange = { [weak self] curve in self?.onCurveChange?(curve) }
 
+        autoElevateCheckbox.font = .systemFont(ofSize: 11)
+        autoElevateCheckbox.controlSize = .small
+        autoElevateCheckbox.target = self
+        autoElevateCheckbox.action = #selector(autoElevateChanged)
+        autoElevateCheckbox.toolTip = "Pide la contraseña al abrir FanLite si la última vez usaste Curva o Máx. Si está desactivado, la pide solo al elegir un modo."
+
         quitButton.target = self
         quitButton.action = #selector(quit)
         quitButton.bezelStyle = .rounded
@@ -213,8 +221,9 @@ final class PopoverView: NSView {
         header.orientation = .horizontal
         header.spacing = 6
 
-        let footer = NSStackView(views: [Self.spacer(), quitButton])
+        let footer = NSStackView(views: [autoElevateCheckbox, Self.spacer(), quitButton])
         footer.orientation = .horizontal
+        footer.spacing = 6
 
         let stack = NSStackView(views: [header, fansLabel, modeControl, curveView, noteLabel, footer])
         stack.orientation = .vertical
@@ -245,12 +254,21 @@ final class PopoverView: NSView {
         onModeChange?(Self.modes[modeControl.selectedSegment])
     }
 
+    @objc private func autoElevateChanged() {
+        onAutoElevateChange?(autoElevateCheckbox.state == .on)
+    }
+
     @objc private func quit() { onQuit?() }
 
     func setMode(_ mode: FanMode) {
         if let index = Self.modes.firstIndex(of: mode), modeControl.selectedSegment != index {
             modeControl.selectedSegment = index
         }
+    }
+
+    func setAutoElevate(_ enabled: Bool) {
+        let desired: NSControl.StateValue = enabled ? .on : .off
+        if autoElevateCheckbox.state != desired { autoElevateCheckbox.state = desired }
     }
 
     func apply(_ snapshot: Snapshot) {
@@ -275,14 +293,16 @@ final class PopoverView: NSView {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
-    private var popover: NSPopover!
+    private var popover: NSPopover?
     private var controller: Controller?
-    private var view: PopoverView!
+    private var view: PopoverView?
     private var settings = FanLiteSettings()
+    private var latestSnapshot = Snapshot()
     private var lastStatusTitle = ""
     private var elevator: Elevator?
+    private var elevating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -315,7 +335,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log("no pude crear el ícono en la barra de menú (¿sin sesión gráfica?); me cierro")
             exit(1)
         }
-        buildPopover()
 
         controller.onUpdate = { [weak self] snapshot in self?.apply(snapshot) }
         controller.start()
@@ -327,7 +346,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let root = geteuid() == 0
         log("FanLite arrancado \(root ? "(root)" : "(usuario, solo lectura)")")
-        if root { Instance.writeRootMarker() }
+        if root {
+            Instance.writeRootMarker()
+            // Los archivos que escribe root deben seguir siendo del usuario de la consola.
+            Store.adoptPathsForConsoleUser()
+        } else if !CommandLine.arguments.contains("--no-elevate") {
+            autoElevateIfNeeded()
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -359,18 +384,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
-    private func buildPopover() {
-        view = PopoverView(frame: NSRect(x: 0, y: 0, width: 344, height: 460))
+    /// El panel se arma recién la primera vez que se abre y se libera al cerrarlo. Es la parte
+    /// más pesada de la app (vistas, capas y superficies de ventana); en reposo no hace falta.
+    @discardableResult
+    private func ensurePopover() -> (NSPopover, PopoverView) {
+        if let popover, let view { return (popover, view) }
+
+        let view = PopoverView(frame: NSRect(x: 0, y: 0, width: 344, height: 460))
         view.onModeChange = { [weak self] mode in self?.modeChanged(mode) }
         view.onCurveChange = { [weak self] curve in self?.controller?.setCurve(curve) }
+        view.onAutoElevateChange = { [weak self] enabled in self?.autoElevateChanged(enabled) }
         view.onQuit = { NSApp.terminate(nil) }
+        view.curveView.curve = controller?.current().curve ?? .fallback
+        view.setAutoElevate(settings.wantsAutoElevation)
 
-        popover = NSPopover()
+        let popover = NSPopover()
         popover.animates = false
         popover.behavior = .transient
         popover.contentSize = NSSize(width: 344, height: 424)
         popover.contentViewController = NSViewController()
         popover.contentViewController?.view = view
+        popover.delegate = self
+
+        self.view = view
+        self.popover = popover
+        return (popover, view)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        controller?.setUIActive(false)
+        // Se libera después del callback: anular el popover dentro de su propio cierre es pedirle
+        // problemas a AppKit. Si se reabrió mientras tanto, el guard lo deja vivo.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.popover?.isShown != true else { return }
+            self.popover = nil
+            self.view = nil
+        }
     }
 
     // MARK: Interacción
@@ -386,17 +435,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.menu = nil
             return
         }
-        if popover.isShown {
-            popover.performClose(nil)
-        } else if let button = statusItem.button {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if popover?.isShown == true {
+            popover?.performClose(nil)
+        } else {
+            openPanel()
         }
     }
 
     @objc private func openPanel() {
-        if !popover.isShown, let button = statusItem.button {
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        }
+        guard popover?.isShown != true, let button = statusItem.button else { return }
+        let (popover, view) = ensurePopover()
+        view.curveView.curve = controller?.current().curve ?? .fallback
+        view.setAutoElevate(settings.wantsAutoElevation)
+        view.apply(latestSnapshot)
+        controller?.setUIActive(true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 
     private func modeChanged(_ mode: FanMode) {
@@ -409,9 +462,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestPrivileges(for: mode)
     }
 
-    /// El único momento en que la app pide la contraseña: cuando querés que mueva los ventiladores.
+    private func autoElevateChanged(_ enabled: Bool) {
+        settings.autoElevateOnLaunch = enabled
+        controller?.setAutoElevateOnLaunch(enabled)
+    }
+
+    /// Si la última vez se usó Curva o Máx, pide la contraseña al arrancar y se reabre como root.
+    /// Si el usuario cancela, sigue en solo lectura y puede reintentar eligiendo un modo.
+    private func autoElevateIfNeeded() {
+        guard geteuid() != 0,
+              settings.wantsAutoElevation,
+              settings.mode != .auto,
+              !elevating else { return }
+
+        guard !Instance.rootMarkerAlive() else {
+            log("hay otra instancia con permisos; arranco en solo lectura")
+            return
+        }
+        beginElevation(mode: settings.mode, automatic: true)
+    }
+
+    private func beginElevation(mode: FanMode, automatic: Bool) {
+        elevating = true
+        if !automatic {
+            // El modo queda guardado antes de reabrir: la instancia root arranca con él.
+            settings.mode = mode
+            Store.save(settings)
+        }
+        // La instancia root tiene que poder tomar el lock de instancia única.
+        Instance.release()
+
+        let elevator = Elevator { [weak self] error in
+            guard let self else { return }
+            self.elevating = false
+            if error == nil {
+                log("arrancó la instancia con privilegios")
+                NSApp.terminate(nil)
+                return
+            }
+
+            log("elevación \(automatic ? "al iniciar" : "manual") fallida: \(error ?? "")")
+            // Si falló, esta instancia sigue viva y tiene que recuperar el lock.
+            _ = Instance.acquire()
+            if automatic {
+                // No tocamos el modo guardado: el próximo arranque puede reintentar.
+                self.view?.setMode(self.controller?.current().mode ?? .auto)
+            } else {
+                self.settings.mode = .auto
+                Store.save(self.settings)
+                self.showElevationFailure(error ?? "")
+            }
+            self.elevator = nil
+        }
+        self.elevator = elevator
+        elevator.start()
+    }
+
+    /// Pide la contraseña cuando el usuario elige Curva o Máx en una instancia sin privilegios.
     private func requestPrivileges(for mode: FanMode) {
-        view.setMode(controller?.current().mode ?? .auto)
+        guard !elevating else { return }
+        view?.setMode(controller?.current().mode ?? .auto)
 
         let alert = NSAlert()
         alert.messageText = "FanLite necesita permiso de administrador"
@@ -434,25 +544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // El modo queda guardado antes de reabrir: la instancia con privilegios arranca con él.
-        settings.mode = mode
-        Store.save(settings)
-        Instance.release()
-
-        let elevator = Elevator { [weak self] error in
-            guard let self else { return }
-            if error == nil {
-                log("arrancó la instancia con privilegios")
-                NSApp.terminate(nil)
-            } else {
-                log("elevación fallida: \(error ?? "")")
-                self.settings.mode = .auto
-                Store.save(self.settings)
-                self.showElevationFailure(error ?? "")
-            }
-        }
-        self.elevator = elevator
-        elevator.start()
+        beginElevation(mode: mode, automatic: false)
     }
 
     private func showElevationFailure(_ reason: String) {
@@ -474,6 +566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Muestras
 
     private func apply(_ snapshot: Snapshot) {
+        latestSnapshot = snapshot
         let title: String
         if let cpu = snapshot.cpuTemp {
             title = String(format: "%.0f°", cpu)
@@ -484,7 +577,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.title = title
             lastStatusTitle = title
         }
-        view.apply(snapshot)
+        // Con el panel cerrado no hay nada que repintar: el título de la barra ya se actualizó.
+        if popover?.isShown == true {
+            view?.apply(snapshot)
+        }
     }
 }
 

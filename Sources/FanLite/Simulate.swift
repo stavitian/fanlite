@@ -15,6 +15,9 @@ final class FakeSMC: SMCDevice {
 
     private(set) var entries: [String: Entry] = [:]
     private(set) var writes: [(key: String, value: Double)] = []
+    /// Claves que el controlador pidió leer en cada vuelta. Sirve para comprobar que no se
+    /// relean los límites ni los RPM reales cuando no hacen falta.
+    private(set) var readKeys: [String] = []
 
     func set(_ key: String, _ value: Double, type: String = "flt ", size: Int = 4, writable: Bool = true) {
         entries[key] = Entry(type: type, size: size, writable: writable, value: value)
@@ -43,7 +46,19 @@ final class FakeSMC: SMCDevice {
         }
     }
 
-    func number(_ key: String) throws -> Double? { value(key) }
+    func number(_ key: String) throws -> Double? {
+        readKeys.append(key)
+        return value(key)
+    }
+
+    func numbers(_ keys: [String]) -> [String: Double] {
+        var values = [String: Double](minimumCapacity: keys.count)
+        for key in keys {
+            readKeys.append(key)
+            if let value = value(key) { values[key] = value }
+        }
+        return values
+    }
 
     func uint8(_ key: String) throws -> Int? { value(key).map { Int($0) } }
 
@@ -66,6 +81,7 @@ final class FakeSMC: SMCDevice {
     func allKeys() -> [String] { Array(entries.keys) }
 
     func clearWrites() { writes.removeAll() }
+    func clearReads() { readKeys.removeAll() }
 }
 
 enum Simulate {
@@ -136,6 +152,22 @@ enum Simulate {
         controller.tick()
         check(smc.writes.isEmpty, "sin escrituras (\(smc.writes.count))")
 
+        print("== 5b. Una vuelta estable no relee límites ni RPM reales ==")
+        smc.clearReads()
+        controller.tick()
+        let fanReads = smc.readKeys.filter { $0.hasPrefix("F") }
+        check(!fanReads.contains { $0.hasSuffix("Mn") || $0.hasSuffix("Mx") },
+              "no leyó límites (\(fanReads.joined(separator: " ")))")
+        check(!fanReads.contains { $0.hasSuffix("Ac") }, "no leyó RPM reales con el panel cerrado")
+        check(fanReads.count == 4, "2 claves por ventilador (\(fanReads.count)): modo y objetivo")
+
+        print("== 5c. Con el panel abierto sí lee los RPM reales ==")
+        controller.uiActive = true
+        smc.clearReads()
+        controller.tick()
+        check(smc.readKeys.filter { $0.hasSuffix("Ac") }.count == 2, "leyó F0Ac y F1Ac")
+        controller.uiActive = false
+
         print("== 6. macOS nos pisa el objetivo -> lo reafirma ==")
         smc.set("F0Tg", 100)
         controller.tick()
@@ -151,22 +183,32 @@ enum Simulate {
         for key in tempKeys { smc.set(key, 60, writable: false) }
         // El suavizado hace que la bajada sea gradual: se le dan unas vueltas hasta que converge.
         for _ in 0..<14 { controller.tick() }
-        // Tolerancia 25 rpm: el controlador no reescribe si el objetivo está a menos de 20 rpm
-        // del ideal (así no manda tráfico al SMC por nada).
-        check(close(smc.value("F0Tg"), expected(25), 25), "objetivo \(Int(smc.value("F0Tg") ?? 0)) rpm tras converger")
+        // Tolerancia = banda muerta: no se reescribe si el objetivo está a menos de ~1 % del
+        // rango (55 rpm) del ideal, así no se manda tráfico al SMC por ruido.
+        check(close(smc.value("F0Tg"), expected(25), 60), "objetivo \(Int(smc.value("F0Tg") ?? 0)) rpm tras converger")
+
+        print("== 8b. Subida lenta: la banda muerta evita escribir en cada vuelta ==")
+        smc.clearWrites()
+        for step in 1...10 {
+            for key in tempKeys { smc.set(key, 60 + Double(step) * 0.1, writable: false) }
+            controller.tick()
+        }
+        let writesPerFan = smc.writes.count / 2
+        check((1...3).contains(writesPerFan),
+              "\(writesPerFan) escrituras por ventilador en 10 vueltas (antes era una por vuelta)")
 
         print("== 9. Clamping: el ventilador no puede pasar de su propio máximo ==")
         smc.set("F1Mx", 3000, writable: false)
         smc.set("F1Tg", 0)
         for key in tempKeys { smc.set(key, 95, writable: false) }
-        controller.tick()
+        controller.tick(forceLimits: true)
         check((smc.value("F1Tg") ?? 0) <= 3000.5, "F1Tg \(Int(smc.value("F1Tg") ?? 0)) rpm ≤ 3000")
         smc.set("F1Mx", 7826, writable: false)
 
         print("== 10. Modo Máx ==")
         controller.settings.mode = .max
         for key in tempKeys { smc.set(key, 50, writable: false) }
-        controller.tick()
+        controller.tick(forceLimits: true)
         check(close(smc.value("F0Tg"), hi) && close(smc.value("F1Tg"), hi), "objetivo máximo en los dos")
 
         print("== 11. Volver a Auto devuelve los ventiladores ==")
@@ -191,6 +233,15 @@ enum Simulate {
         check(curve.percent(at: 100) == 100, "100 °C → 100 %")
         check(abs(curve.percent(at: 78.5) - 60) < 0.01, "78.5 °C → 60 % (interpolado)")
         check(curve.percent(at: 99) == 100 && curve.percent(at: 45) == 0, "extremos planos")
+
+        print("== 14. Config vieja sin autoElevateOnLaunch ==")
+        let legacy = """
+        {"mode":"curve","interval":2,"curve":{"points":[{"temp":45,"percent":0},{"temp":95,"percent":100}]}}
+        """
+        let decoded = legacy.data(using: .utf8)
+            .flatMap { try? JSONDecoder().decode(FanLiteSettings.self, from: $0) }
+        check(decoded?.mode == .curve, "conserva el modo guardado")
+        check(decoded?.wantsAutoElevation == true, "por defecto pide permisos al iniciar")
 
         print("")
         print(failures == 0 ? "TODO OK (\(checks) comprobaciones)" : "\(failures) FALLAS de \(checks) comprobaciones")
