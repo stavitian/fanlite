@@ -18,37 +18,147 @@ enum FanMode: String, Codable {
 
 // MARK: - Curva
 
-struct CurvePoint: Codable, Equatable {
-    var temp: Double        // °C
-    var percent: Double     // 0...100
-}
-
+/// Curva de cinco filas: cada fila pide un porcentaje fijo de ventilador y guarda la temperatura
+/// a la que se alcanza. Las temperaturas se mantienen ordenadas y separadas al menos `minGap`
+/// grados; la validación vive acá para que el editor solo tenga que mostrar el resultado.
 struct Curve: Codable, Equatable {
-    var points: [CurvePoint]
+    /// Porcentajes de las cinco filas, de menor a mayor.
+    static let percentages: [Double] = [20, 40, 60, 80, 100]
+    /// Temperaturas de la curva por defecto: 33 / 40 / 65 / 75 / 83 °C.
+    static let defaultTemps: [Double] = [33, 40, 65, 75, 83]
 
-    static let fallback = Curve(points: [
-        CurvePoint(temp: 45, percent: 0),
-        CurvePoint(temp: 60, percent: 25),
-        CurvePoint(temp: 72, percent: 45),
-        CurvePoint(temp: 85, percent: 75),
-        CurvePoint(temp: 95, percent: 100),
-    ])
+    static let minTemp: Double = 30
+    static let maxTemp: Double = 105
+    static let minGap: Double = 3
 
-    var sorted: [CurvePoint] { points.sorted { $0.temp < $1.temp } }
+    static let fallback = Curve(temps: defaultTemps)
 
-    /// Interpolación lineal, plana fuera del primer y último punto.
+    /// Una temperatura por fila, alineada con `percentages`.
+    private(set) var temps: [Double]
+
+    init(temps: [Double]) {
+        self.temps = Self.sanitized(temps)
+    }
+
+    func temp(at index: Int) -> Double {
+        temps.indices.contains(index) ? temps[index] : Self.minTemp
+    }
+
+    /// Temperatura de la fila `index` ya validada: dentro de 30–105 °C y a `minGap` de sus
+    /// vecinas. Editar una fila nunca mueve a las demás; se clampea entre ellas.
+    func clamped(_ value: Double, at index: Int) -> Double {
+        guard temps.indices.contains(index) else { return value }
+        let low = index > 0 ? temps[index - 1] + Self.minGap : Self.minTemp
+        let high = index < temps.count - 1 ? temps[index + 1] - Self.minGap : Self.maxTemp
+        return min(max(value.rounded(), low), high)
+    }
+
+    /// Copia de la curva con la fila `index` en `value`, ya validada.
+    func setting(_ value: Double, at index: Int) -> Curve {
+        guard temps.indices.contains(index) else { return self }
+        var next = temps
+        next[index] = clamped(value, at: index)
+        return Curve(temps: next)
+    }
+
+    /// Interpolación lineal entre filas; 0 % por debajo de la primera y plana arriba de la última.
     func percent(at temp: Double) -> Double {
-        let p = sorted
-        guard let first = p.first, let last = p.last else { return 0 }
-        if temp <= first.temp { return first.percent }
-        if temp >= last.temp { return last.percent }
-        for i in 1..<p.count where temp <= p[i].temp {
-            let a = p[i - 1], b = p[i]
-            let width = b.temp - a.temp
-            guard width > 0 else { return b.percent }
-            return a.percent + (b.percent - a.percent) * (temp - a.temp) / width
+        guard let first = temps.first, let last = temps.last, temps.count > 1 else { return 0 }
+        if temp < first { return 0 }
+        if temp >= last { return Self.percentages[Self.percentages.count - 1] }
+        for i in 1..<temps.count where temp <= temps[i] {
+            let a = temps[i - 1], b = temps[i]
+            let width = b - a
+            let fa = Self.percentages[i - 1], fb = Self.percentages[i]
+            guard width > 0 else { return fb }
+            return fa + (fb - fa) * (temp - a) / width
         }
-        return last.percent
+        return Self.percentages[Self.percentages.count - 1]
+    }
+
+    // MARK: - Validación
+
+    /// Clampea al rango y empuja las filas para que no queden a menos de `minGap` grados.
+    /// Con cinco filas sobra lugar, pero el empuje va primero hacia arriba y, si se pasa del
+    /// máximo, vuelve desde el final para que todo quede dentro de 30–105 °C.
+    private static func sanitized(_ values: [Double]) -> [Double] {
+        guard values.count == percentages.count else { return defaultTemps }
+        var temps = values.map { value in
+            guard value.isFinite else { return minTemp }
+            return min(max(value.rounded(), minTemp), maxTemp)
+        }
+        for i in 1..<temps.count {
+            temps[i] = max(temps[i], temps[i - 1] + minGap)
+        }
+        if let last = temps.last, last > maxTemp {
+            temps[temps.count - 1] = maxTemp
+            for i in stride(from: temps.count - 2, through: 0, by: -1) {
+                temps[i] = min(temps[i], temps[i + 1] - minGap)
+            }
+        }
+        return temps
+    }
+
+    // MARK: - Codable
+
+    private enum CodingKeys: String, CodingKey {
+        case temps
+        case points
+    }
+
+    /// Forma vieja de la curva (puntos libres). Solo sirve para migrar configuraciones.
+    private struct LegacyPoint: Codable {
+        var temp: Double
+        var percent: Double
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let temps = try? container.decode([Double].self, forKey: .temps), temps.count == Self.percentages.count {
+            self.temps = Self.sanitized(temps)
+        } else if let points = try? container.decode([LegacyPoint].self, forKey: .points) {
+            self.temps = Self.migrated(from: points)
+        } else {
+            self.temps = Self.defaultTemps
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(temps, forKey: .temps)
+    }
+
+    /// Convierte una curva vieja de puntos libres a las cinco filas fijas: para cada porcentaje
+    /// busca la menor temperatura a la que la curva anterior llegaba. Así se conserva la idea
+    /// (a qué temperatura empieza a pedir cada tramo) aunque los porcentajes ya no se editen.
+    private static func migrated(from points: [LegacyPoint]) -> [Double] {
+        let sorted = points
+            .filter { $0.temp.isFinite && $0.percent.isFinite }
+            .sorted { $0.temp < $1.temp }
+        guard let first = sorted.first, let last = sorted.last else { return defaultTemps }
+
+        var temps: [Double] = []
+        for target in percentages {
+            if target <= first.percent {
+                temps.append(first.temp)
+                continue
+            }
+            if target >= last.percent {
+                temps.append(last.temp)
+                continue
+            }
+            var found: Double?
+            for i in 1..<sorted.count {
+                let a = sorted[i - 1], b = sorted[i]
+                guard a.percent < target, target <= b.percent else { continue }
+                let width = b.percent - a.percent
+                let fraction = width > 0 ? (target - a.percent) / width : 1
+                found = a.temp + fraction * (b.temp - a.temp)
+                break
+            }
+            temps.append(found ?? last.temp)
+        }
+        return sanitized(temps)
     }
 }
 
@@ -110,6 +220,8 @@ enum Paths {
     }
 
     static var config: URL { supportDirectory.appendingPathComponent("config.json") }
+    /// Marcador del primer arranque de la GUI. Vive fuera de la config porque esta puede ser de root.
+    static var firstLaunchMarker: URL { supportDirectory.appendingPathComponent("first-launch.done") }
 }
 
 enum Store {
@@ -151,6 +263,7 @@ enum Store {
         var urls = [Paths.supportDirectory, Paths.config, Paths.log]
         urls.append(Paths.supportDirectory.appendingPathComponent("instance.pid"))
         urls.append(Paths.supportDirectory.appendingPathComponent("root.pid"))
+        urls.append(Paths.firstLaunchMarker)
         for url in urls where manager.fileExists(atPath: url.path) {
             try? manager.setAttributes([
                 .ownerAccountID: uid,

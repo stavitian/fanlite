@@ -122,7 +122,7 @@ final class Controller {
                 self.curveCommitScheduled = false
                 self.timer?.cancel()
                 self.timer = nil
-                // Si se cerró en medio de un arrastre, guarda la última curva.
+                // Si se cerró en medio de una edición, guarda la última curva.
                 if pendingCurveSave { Store.save(self.settings) }
                 if geteuid() == 0 {
                     let states = self.readStates()
@@ -183,9 +183,8 @@ final class Controller {
         }
     }
 
-    /// El editor llama a `setCurve` en cada evento del mouse. Guardar el JSON y leer el SMC en
-    /// cada uno era una ráfaga de decenas de operaciones por segundo mientras se arrastra un
-    /// punto; con esto se hace como máximo un commit cada 0,4 s durante el arrastre.
+    /// El editor llama a `setCurve` al confirmar un campo. Guardar el JSON y leer el SMC en cada
+    /// pulsación era una ráfaga de operaciones; con esto se hace como máximo un commit cada 0,4 s.
     private func scheduleCurveCommit() {
         guard !curveCommitScheduled else { return }
         curveCommitScheduled = true
@@ -481,7 +480,13 @@ final class Controller {
                     }
                     let demanded = settings.curve.percent(at: smoothedTemp ?? cpu)
                     percent = demanded.rounded()
-                    apply(percent: demanded, states: states)
+                    if demanded <= 0 {
+                        // Debajo de la primera fila: apagados. El SMC no acepta 0 rpm como
+                        // objetivo (F<n>Mn es el mínimo), así que se devuelven a macOS.
+                        releaseAll(states)
+                    } else {
+                        apply(percent: demanded, states: states)
+                    }
                 } else if tempMisses >= Self.tempMissLimit {
                     log("sin lecturas de temperatura: ventiladores a Auto")
                     releaseAll(states)
@@ -525,7 +530,9 @@ final class Controller {
             let deadband = max(Self.minWriteDeadbandRPM,
                                (state.maxRPM - state.minRPM) * Self.writeDeadbandFraction)
             let reference = lastWritten[state.index] ?? state.target
-            let drifted = abs(state.target - wanted) > Self.driftToleranceRPM
+            // "Nos pisaron" es que el SMC se haya ido de lo último que escribimos, no de lo que
+            // la curva pide ahora: si no, cualquier cambio de más de 20 rpm se saltaría la banda.
+            let drifted = abs(state.target - reference) > Self.driftToleranceRPM
             let bigEnoughStep = abs(reference - wanted) > deadband
             if !drifted && !bigEnoughStep { continue }
             setTarget(state, keys: keys, rpm: wanted)

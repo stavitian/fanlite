@@ -138,13 +138,13 @@ enum Simulate {
         check(smc.value("F1md") == 0, "F1md sigue en 0")
         check(smc.writes.count == 1, "una sola escritura (\(smc.writes.map(\.key))")
 
-        print("== 4. Curva a 70 °C (esperado ~41.7 % = \(Int(expected(41.666)))) ==")
+        print("== 4. Curva a 70 °C (esperado 70 % = \(Int(expected(70)))) ==")
         smc.clearWrites()
         for key in tempKeys { smc.set(key, 70, writable: false) }
         controller.settings.mode = .curve
         controller.tick()
         check(smc.value("F0md") == 1 && smc.value("F1md") == 1, "los dos pasaron a manual")
-        check(close(smc.value("F0Tg"), expected(41.6667), 2) && close(smc.value("F1Tg"), expected(41.6667), 2),
+        check(close(smc.value("F0Tg"), expected(70), 2) && close(smc.value("F1Tg"), expected(70), 2),
               "objetivos \(Int(smc.value("F0Tg") ?? 0)) / \(Int(smc.value("F1Tg") ?? 0)) rpm")
 
         print("== 5. Sin cambios: no vuelve a escribir ==")
@@ -171,7 +171,7 @@ enum Simulate {
         print("== 6. macOS nos pisa el objetivo -> lo reafirma ==")
         smc.set("F0Tg", 100)
         controller.tick()
-        check(close(smc.value("F0Tg"), expected(41.6667), 2), "F0Tg reafirmado en \(Int(smc.value("F0Tg") ?? 0)) rpm")
+        check(close(smc.value("F0Tg"), expected(70), 2), "F0Tg reafirmado en \(Int(smc.value("F0Tg") ?? 0)) rpm")
 
         print("== 7. Failsafe a 94 °C -> máximo ==")
         for key in tempKeys { smc.set(key, 94, writable: false) }
@@ -179,23 +179,40 @@ enum Simulate {
         check(close(smc.value("F0Tg"), hi) && close(smc.value("F1Tg"), hi), "objetivo \(Int(smc.value("F0Tg") ?? 0)) rpm = máximo")
         check(controller.snapshot.percent == 100, "el panel muestra 100 %")
 
-        print("== 8. Baja a 60 °C (curva 25 % = \(Int(expected(25)))) ==")
+        print("== 8. Baja a 60 °C (curva 56 % = \(Int(expected(56)))) ==")
         for key in tempKeys { smc.set(key, 60, writable: false) }
         // El suavizado hace que la bajada sea gradual: se le dan unas vueltas hasta que converge.
         for _ in 0..<14 { controller.tick() }
         // Tolerancia = banda muerta: no se reescribe si el objetivo está a menos de ~1 % del
         // rango (55 rpm) del ideal, así no se manda tráfico al SMC por ruido.
-        check(close(smc.value("F0Tg"), expected(25), 60), "objetivo \(Int(smc.value("F0Tg") ?? 0)) rpm tras converger")
+        check(close(smc.value("F0Tg"), expected(56), 60), "objetivo \(Int(smc.value("F0Tg") ?? 0)) rpm tras converger")
 
         print("== 8b. Subida lenta: la banda muerta evita escribir en cada vuelta ==")
+        // En el tramo 65–75 °C la curva sube 2 % por grado. Pasos de 0,1 °C mueven el objetivo
+        // menos que la banda muerta en cada vuelta, así que solo se escribe cuando la suma pasa.
+        for key in tempKeys { smc.set(key, 65, writable: false) }
+        for _ in 0..<14 { controller.tick() }
         smc.clearWrites()
-        for step in 1...10 {
-            for key in tempKeys { smc.set(key, 60 + Double(step) * 0.1, writable: false) }
+        for step in 1...20 {
+            for key in tempKeys { smc.set(key, 65 + Double(step) * 0.1, writable: false) }
             controller.tick()
         }
         let writesPerFan = smc.writes.count / 2
         check((1...3).contains(writesPerFan),
-              "\(writesPerFan) escrituras por ventilador en 10 vueltas (antes era una por vuelta)")
+              "\(writesPerFan) escrituras por ventilador en 20 vueltas (antes era una por vuelta)")
+
+        print("== 8c. Debajo de la primera fila (33 °C) apaga los ventiladores ==")
+        for key in tempKeys { smc.set(key, 20, writable: false) }
+        // El suavizado tarda en bajar: con 12 vueltas cruza el primer valor de la curva.
+        for _ in 0..<12 { controller.tick() }
+        check(smc.value("F0md") == 0 && smc.value("F1md") == 0, "los dos volvieron a Auto")
+        check(controller.snapshot.percent == 0, "la curva pide 0 %")
+
+        print("== 8d. Al volver a subir, la curva retoma el control ==")
+        for key in tempKeys { smc.set(key, 40, writable: false) }
+        for _ in 0..<4 { controller.tick() }
+        check(smc.value("F0md") == 1 && smc.value("F1md") == 1, "los dos volvieron a manual")
+        check((smc.value("F0Tg") ?? 0) > lo, "volvió a escribir un objetivo")
 
         print("== 9. Clamping: el ventilador no puede pasar de su propio máximo ==")
         smc.set("F1Mx", 3000, writable: false)
@@ -228,11 +245,43 @@ enum Simulate {
 
         print("== 13. Curva: interpolación y plana fuera de rango ==")
         let curve = Curve.fallback
-        check(curve.percent(at: 30) == 0, "30 °C → 0 %")
-        check(curve.percent(at: 60) == 25, "60 °C → 25 %")
-        check(curve.percent(at: 100) == 100, "100 °C → 100 %")
-        check(abs(curve.percent(at: 78.5) - 60) < 0.01, "78.5 °C → 60 % (interpolado)")
-        check(curve.percent(at: 99) == 100 && curve.percent(at: 45) == 0, "extremos planos")
+        check(curve.temps == [33, 40, 65, 75, 83], "defaults 33 / 40 / 65 / 75 / 83 °C")
+        check(curve.percent(at: 30) == 0, "30 °C → 0 % (debajo de la primera fila)")
+        check(curve.percent(at: 33) == 20, "33 °C → 20 %")
+        check(curve.percent(at: 40) == 40, "40 °C → 40 %")
+        check(curve.percent(at: 65) == 60, "65 °C → 60 %")
+        check(curve.percent(at: 75) == 80, "75 °C → 80 %")
+        check(curve.percent(at: 83) == 100, "83 °C → 100 %")
+        check(abs(curve.percent(at: 78.5) - 88.75) < 0.01, "78.5 °C → 88.75 % (interpolado)")
+        check(curve.percent(at: 20) == 0 && curve.percent(at: 105) == 100, "0 % abajo y 100 % arriba")
+
+        print("== 13b. Validación de las cinco filas ==")
+        let base = Curve(temps: [33, 40, 65, 75, 83])
+        check(base.clamped(10, at: 0) == 30, "la primera fila no baja de 30 °C")
+        check(base.clamped(200, at: 4) == 105, "la última no pasa de 105 °C")
+        check(base.clamped(10, at: 2) == 43, "la fila se clampea 3 °C arriba de la anterior")
+        check(base.clamped(200, at: 2) == 72, "y 3 °C abajo de la siguiente")
+        check(base.setting(70, at: 2).temps == [33, 40, 70, 75, 83], "editar una fila no mueve a las demás")
+        let tight = Curve(temps: [30, 33, 36, 39, 42])
+        check(tight.clamped(100, at: 2) == 36, "sin lugar, queda en el único valor válido entre vecinas")
+        let messy = Curve(temps: [200, 10, 100, 20, 300])
+        check(messy.temps.count == 5, "siempre quedan cinco filas")
+        check(messy.temps.allSatisfy { $0 >= 30 && $0 <= 105 }, "todas dentro de 30–105 °C")
+        check(zip(messy.temps, messy.temps.dropFirst()).allSatisfy { $1 - $0 >= 3 },
+              "todas separadas por al menos 3 °C")
+        check(Curve(temps: [1, 2]).temps == Curve.defaultTemps, "una cantidad rara cae en los defaults")
+
+        print("== 13c. Migración de una curva vieja ==")
+        let oldCurve = """
+        {"points":[{"temp":45,"percent":0},{"temp":60,"percent":25},{"temp":72,"percent":45},{"temp":85,"percent":75},{"temp":95,"percent":100}]}
+        """
+        let migrated = oldCurve.data(using: .utf8)
+            .flatMap { try? JSONDecoder().decode(Curve.self, from: $0) }
+        check(migrated?.temps == [57, 69, 79, 87, 95],
+              "los puntos viejos caen en 57 / 69 / 79 / 87 / 95 °C")
+        let encoded = try? JSONEncoder().encode(Curve.fallback)
+        let roundTrip = encoded.flatMap { try? JSONDecoder().decode(Curve.self, from: $0) }
+        check(roundTrip == Curve.fallback, "la curva nueva hace round-trip")
 
         print("== 14. Config vieja sin autoElevateOnLaunch ==")
         let legacy = """
@@ -242,6 +291,7 @@ enum Simulate {
             .flatMap { try? JSONDecoder().decode(FanLiteSettings.self, from: $0) }
         check(decoded?.mode == .curve, "conserva el modo guardado")
         check(decoded?.wantsAutoElevation == true, "por defecto pide permisos al iniciar")
+        check(decoded?.curve.temps == [55, 65, 75, 85, 95], "migra la curva vieja en vez de descartarla")
 
         print("")
         print(failures == 0 ? "TODO OK (\(checks) comprobaciones)" : "\(failures) FALLAS de \(checks) comprobaciones")

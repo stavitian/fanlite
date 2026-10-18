@@ -13,6 +13,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp ".build/$CONFIG/FanLite" "$APP/Contents/MacOS/FanLite"
 cp scripts/Info.plist "$APP/Contents/Info.plist"
 cp scripts/askpass.sh "$APP/Contents/Resources/askpass.sh"
+cp scripts/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 chmod +x "$APP/Contents/MacOS/FanLite" "$APP/Contents/Resources/askpass.sh"
 
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "aviso: no se pudo firmar (igual funciona)"
