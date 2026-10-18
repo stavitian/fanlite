@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/macOS-14%2B-blue" alt="macOS 14+">
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20to%20M5-blue" alt="Apple Silicon">
   <img src="https://img.shields.io/badge/Swift-5.10%2B-orange" alt="Swift">
+  <img src="https://img.shields.io/badge/Apple-notarizada-success?logo=apple" alt="Notarizada por Apple">
   <img src="https://img.shields.io/badge/licencia-MIT-green" alt="Licencia MIT">
 </p>
 
@@ -59,14 +60,16 @@ daemon, el catálogo de sensores, las reglas ni las ventanas extra.
 1. Descargá **FanLite-1.0.0.dmg** desde el [último release](https://github.com/stavitian/fanlite/releases/latest).
 2. Abrilo y arrastrá **FanLite** a **Aplicaciones**.
 3. Abrí FanLite desde Aplicaciones. Vive en la barra de menú; no aparece en el Dock.
-4. La primera vez macOS puede decir que no puede verificar la app. FanLite es código abierto y no
-   está notarizado (eso requiere una cuenta paga de Apple Developer). Abrila una vez, después andá a
-   **Ajustes del Sistema → Privacidad y seguridad**, bajá y hacé clic en **Abrir igualmente**. Solo
-   hace falta una vez. Desde Terminal también podés correr:
-   `xattr -dr com.apple.quarantine /Applications/FanLite.app`
+4. La versión oficial está **firmada con Developer ID y notarizada por Apple**, con Hardened
+   Runtime, marca de tiempo segura y el ticket de notarización adjunto. Si el Mac permite apps de
+   desarrolladores identificados, no hace falta **Abrir igualmente**. macOS puede mostrar la
+   confirmación habitual al abrir por primera vez una app descargada.
 
 **Requisitos:** una Mac con Apple Silicon (M1 a M5) y macOS 14 Sonoma o posterior. Las MacBook Air
 sin ventiladores solo monitorean.
+
+El release incluye las sumas SHA-256 en `SHA256SUMS.txt`. Una compilación propia necesita su propia
+firma y notarización; el estado indicado arriba corresponde a la app oficial descargable.
 
 ## Primer arranque y permisos
 
@@ -144,20 +147,22 @@ de curva y el panel perezoso son las diferencias más grandes.
 ## Compilar desde el código
 
 Requiere macOS 14+, Xcode o el toolchain de Swift 5.10+. No hace falta cuenta de Apple Developer;
-la app se firma ad-hoc.
+la app usa Developer ID si encuentra una única identidad en el llavero y, en caso contrario, firma ad-hoc.
 
 ```sh
 git clone https://github.com/stavitian/fanlite.git
 cd fanlite
 
 swift build                      # build debug
-scripts/build_app.sh             # build/FanLite.app (release, firmada ad-hoc)
+scripts/build_app.sh             # build/FanLite.app (release, Developer ID si está disponible)
 scripts/make_dmg.sh --build      # dist/FanLite-<version>.dmg y .zip
 
 .build/debug/FanLite --simulate  # 52 comprobaciones contra un SMC falso
 .build/debug/FanLite --dump      # sensores, límites y estado actual
 sudo .build/debug/FanLite --selftest   # prueba de hardware supervisada; devuelve a Auto
 ```
+
+Para distribuir con firma, Hardened Runtime, marca de tiempo y notarización, ver [la guía de notarización](docs/NOTARIZATION.es.md).
 
 El ícono de la app se genera con `scripts/make_icon.py` (requiere Pillow). El `.icns` está
 commiteado, así que solo lo necesitás si cambiás el dibujo.
@@ -204,7 +209,6 @@ FanLite (un solo proceso)
 - Las MacBook Air sin ventiladores solo monitorean.
 - La interfaz de la barra de menú está **solo en español**. Este README también está en
   [inglés](README.md).
-- No está notarizada: la primera apertura requiere **Abrir igualmente**.
 - Usala bajo tu responsabilidad. Escribe en el SMC; mirá las temperaturas mientras probás una curva
   nueva.
 
